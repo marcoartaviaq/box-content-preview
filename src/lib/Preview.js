@@ -4,8 +4,10 @@ import EventEmitter from 'events';
 import cloneDeep from 'lodash/cloneDeep';
 import throttle from 'lodash/throttle';
 /* eslint-enable import/first */
+import uuidv4 from 'uuid/v4';
 import Api from './api';
 import Browser from './Browser';
+import BoundedCache from './BoundedCache';
 import Logger from './Logger';
 import loaderList from './loaders';
 import Cache from './Cache';
@@ -78,6 +80,13 @@ const LOG_RETRY_COUNT = 3; // number of times to retry logging preview event
 const MS_IN_S = 1000; // ms in a sec
 const SUPPORT_URL = 'https://support.box.com';
 
+const CONTENT_INSIGHTS_REPORTING_INTERVAL = 5000; // number of seconds elapsed between each content insights reporting
+const DOCUMENT = 'document';
+const PAGE_VIEW = 'pageView';
+const CONTENT_INSIGHTS_REPORT_TRESHOLD = 2000;
+const CONTENT_INSIGHTS_IDLE_TIMER = 30000;
+const CONTENT_INSIGHTS_ACTIVE_USER_THROTTLE = 250;
+
 // All preview assets are relative to preview.js. Here we create a location
 // object that mimics the window location object and points to where
 // preview.js is loaded from by the browser. This needs to be done statically
@@ -144,6 +153,21 @@ class Preview extends EventEmitter {
     /** @property {PreviewUI} - Preview's UI instance */
     ui;
 
+    /** @property {Object} - Reference to content insights object */
+    contentInsightsProps = {
+        currentPage: null,
+        eventType: null,
+        fileLength: null,
+        fileType: null,
+        idleTimer: null,
+        interval: null,
+        reportingStarted: false,
+        sessionId: uuidv4(), // Change to a timestamp-userId-bff
+        startTime: null,
+        thumbnailImageCache: new BoundedCache(),
+        pdfViewer: null,
+    };
+
     //--------------------------------------------------------------------------
     // Public
     //--------------------------------------------------------------------------
@@ -182,6 +206,7 @@ class Preview extends EventEmitter {
         this.navigateLeft = this.navigateLeft.bind(this);
         this.navigateRight = this.navigateRight.bind(this);
         this.keydownHandler = this.keydownHandler.bind(this);
+        this.throttledActiveUserHandler = this.activeUserHandler().bind(this);
     }
 
     /**
@@ -216,6 +241,14 @@ class Preview extends EventEmitter {
         }
 
         this.viewer = undefined;
+
+        // Unbind user interaction event listeners
+        this.unbindIdleUserEvents(this.container);
+        this.stopContentInsightsInterval();
+        if (this.contentInsightsProps.thumbnailImageCache) {
+            this.contentInsightsProps.thumbnailImageCache.destroy();
+            this.contentInsightsProps.thumbnailImageCache = null;
+        }
     }
 
     /**
@@ -309,7 +342,6 @@ class Preview extends EventEmitter {
             if (!this.file.id) {
                 return;
             }
-
             this.load(this.file.id);
         }
     }
@@ -877,6 +909,9 @@ class Preview extends EventEmitter {
         // Start the preview duration timer when the user starts to perceive preview's load
         const previewDurationTag = Timer.createTag(this.file.id, DURATION_METRIC);
         Timer.start(previewDurationTag);
+
+        // Bind user interaction event listeners to check if the user is idle or not
+        this.bindIdleUserEvents(this.container);
     }
 
     /**
@@ -1242,6 +1277,7 @@ class Preview extends EventEmitter {
         this.viewer.addListener('error', this.triggerError);
         this.viewer.addListener(VIEWER_EVENT.default, this.handleViewerEvents);
         this.viewer.addListener(VIEWER_EVENT.metric, this.handleViewerMetrics);
+        this.viewer.addListener(VIEWER_EVENT.pageChange, this.handleViewerPageChange);
     }
 
     /**
@@ -1358,6 +1394,12 @@ class Preview extends EventEmitter {
             // If there wasn't an error and event logging is not disabled, use Events API to log a preview
             if (!this.options.disableEventLog) {
                 this.logPreviewEvent(this.file.id, this.options);
+                if (
+                    this.previewOptions.contentInsightsOptions &&
+                    this.previewOptions.contentInsightsOptions.contentInsightsConfig.isActive
+                ) {
+                    this.initContentInsightsLog(data);
+                }
             }
 
             // Hookup for phantom JS health check
@@ -1397,6 +1439,11 @@ class Preview extends EventEmitter {
             source: {
                 type: 'file',
                 id: fileId,
+            },
+            additional_information: {
+                view_session: {
+                    session_id: this.contentInsightsProps.sessionId,
+                },
             },
         };
         const headers = getHeaders({}, token, sharedLink, sharedLinkPassword);
@@ -1704,7 +1751,6 @@ class Preview extends EventEmitter {
                     // Append optional query params
                     const fileVersionId = this.getFileOption(fileId, FILE_OPTION_FILE_VERSION_ID) || '';
                     const fileInfoUrl = appendQueryParams(getURL(fileId, fileVersionId, apiHost), params);
-
                     // Prefetch and cache file information and content
                     this.api
                         .get(fileInfoUrl, { headers: this.getRequestHeaders(token) })
@@ -1939,6 +1985,334 @@ class Preview extends EventEmitter {
         return getTokens(this.file.id, this.previewOptions.token).then(
             tokenOrTokenMap => tokenOrTokenMap[this.file.id],
         );
+    };
+
+    /**
+     * Creates the image element
+     * @param {string} dataUrl - The image data URL for the thumbnail
+     * @return {HTMLElement} - The image element
+     */
+    createImageEl = dataUrl => {
+        // const imageEl = document.createElement('div');
+        // imageEl.style.backgroundImage = `url('${dataUrl}')`;
+        const imageEl = document.createElement('img');
+        imageEl.src = `${dataUrl}`;
+        return imageEl;
+    };
+
+    /**
+     * Given a page number, generates the image data URL for the image of the page
+     * @param {number} pageNum  - The page number of the document
+     * @return {string} The data URL of the page image
+     */
+    getThumbnailDataURL = pageNum => {
+        const canvas = document.createElement('canvas');
+        const THUMBNAIL_TOTAL_WIDTH = 150; // 190px sidebar width - 40px margins
+        const THUMBNAIL_IMAGE_WIDTH = THUMBNAIL_TOTAL_WIDTH * 2; // Multiplied by a scaling factor so that we render the image at a higher resolution
+        return this.viewer.pdfViewer.pdfDocument
+            .getPage(pageNum)
+            .then(page => {
+                const { width, height } = page.getViewport({ scale: 1 });
+                // Get the current page w:h ratio in case it differs from the first page
+                const curPageRatio = width / height;
+
+                // Handle the case where the current page's w:h ratio is less than the
+                // `pageRatio` which means that this page is probably more portrait than
+                // landscape
+                if (curPageRatio < this.pageRatio) {
+                    // Set the canvas height to that of the thumbnail max height
+                    canvas.height = Math.ceil(THUMBNAIL_IMAGE_WIDTH / this.pageRatio);
+                    // Find the canvas width based on the current page ratio
+                    canvas.width = canvas.height * curPageRatio;
+                } else {
+                    // In case the current page ratio is same as the first page
+                    // or in case it's larger (which means that it's wider), keep
+                    // the width at the max thumbnail width
+                    canvas.width = THUMBNAIL_IMAGE_WIDTH;
+                    // Find the height based on the current page ratio
+                    canvas.height = Math.ceil(THUMBNAIL_IMAGE_WIDTH / curPageRatio);
+                }
+
+                // The amount for which to scale down the current page
+                const { width: canvasWidth } = canvas;
+                const scale = canvasWidth / width;
+                return page.render({
+                    canvasContext: canvas.getContext('2d'),
+                    viewport: page.getViewport({ scale }),
+                }).promise;
+            })
+            .then(() => canvas.toDataURL());
+    };
+
+    /**
+     * Get a thumbnail image element
+     *
+     * @param {number} pageNumber - the page number
+     * @return {Promise} - promise resolves with the image HTMLElement or null if generation is in progress
+     */
+    getThumbnail = pageNumber => {
+        if (this.viewer && this.viewer.pdfViewer && this.viewer.pdfViewer.pdfDocument) {
+            if (!this.contentInsightsProps.thumbnailImageCache) {
+                this.contentInsightsProps.thumbnailImageCache = new BoundedCache();
+            }
+
+            const cacheEntry = this.contentInsightsProps.thumbnailImageCache.get(pageNumber);
+            // If this thumbnail has already been cached, use it
+            if (cacheEntry && cacheEntry.image) {
+                return Promise.resolve(cacheEntry.image);
+            }
+
+            // If this thumbnail has already been requested, resolve with null
+            if (cacheEntry && cacheEntry.inProgress) {
+                return Promise.resolve(null);
+            }
+
+            // Update the cache entry to be in progress
+            this.contentInsightsProps.thumbnailImageCache.set(pageNumber, { ...cacheEntry, inProgress: true });
+
+            const thumb = this.getThumbnailDataURL(pageNumber);
+            if (thumb) {
+                return thumb.then(this.createImageEl).then(imageEl => {
+                    // Cache this image element for future use
+                    this.contentInsightsProps.thumbnailImageCache.set(pageNumber, {
+                        inProgress: false,
+                        image: imageEl,
+                    });
+
+                    return imageEl;
+                });
+            }
+        }
+        return null;
+    };
+
+    /**
+     * Call the interval starting function and set the idle timer
+     *
+     * @private
+     * @param {Object} data - Data Object to set the current page and file length
+     * @return {void}
+     */
+    initContentInsightsLog = data => {
+        if (data.currentPage) {
+            this.contentInsightsProps.currentPage = data.currentPage;
+            this.contentInsightsProps.fileLength = data.numPages;
+            this.contentInsightsProps.fileType = DOCUMENT;
+            this.contentInsightsProps.eventType = PAGE_VIEW;
+        }
+        this.setIdleTimer();
+        this.contentInsightsProps.reportingStarted = true;
+        this.startContentInsightsInterval();
+    };
+
+    /**
+     * Start the content insights interval, to report data each number of seconds defined on a Const
+     *
+     * @private
+     * @return {void}
+     */
+    startContentInsightsInterval = () => {
+        if (!this.contentInsightsProps.reportingStarted) {
+            return;
+        }
+        if (this.contentInsightsProps.interval) {
+            this.stopContentInsightsInterval();
+        }
+        this.contentInsightsProps.startTime = Date.now();
+
+        this.contentInsightsProps.interval = setInterval(() => {
+            this.reportContentInsight();
+        }, CONTENT_INSIGHTS_REPORTING_INTERVAL);
+    };
+
+    /**
+     * Stop the content insights interval, for example, if a user goes idle or the user changes the page
+     * and report the data
+     *
+     * @private
+     * @return {void}
+     */
+    stopContentInsightsInterval = () => {
+        if (!this.contentInsightsProps.reportingStarted) {
+            return;
+        }
+        clearInterval(this.contentInsightsProps.interval);
+        this.contentInsightsProps.interval = null;
+        this.reportContentInsight();
+    };
+
+    /**
+     * Handle the page change event. At this moment, it would stop the current timer interval,
+     * report the data for the previous page, and start the interval again
+     *
+     * @private
+     * @param {Object} data - Data Object to set the current page
+     * @return {void}
+     */
+    handleViewerPageChange = data => {
+        this.stopContentInsightsInterval();
+        if (data.currentPage) {
+            this.contentInsightsProps.currentPage = data.currentPage;
+        }
+        this.startContentInsightsInterval();
+    };
+
+    /**
+     * Set the idle timeout and call the inactiveUserHandler
+     *
+     * @private
+     * @return {void}
+     */
+    setIdleTimer = () => {
+        this.contentInsightsProps.idleTimer = setTimeout(this.inactiveUserHandler, CONTENT_INSIGHTS_IDLE_TIMER);
+    };
+
+    /**
+     * Reset the idle timeout to avoid calling the inactiveUserHandler if the user is active.
+     * Also, if the content insights interval is stopped (because the user was inactive) restart the interval
+     *
+     * @private
+     * @return {void}
+     */
+    resetIdleTimer = () => {
+        if (!this.contentInsightsProps.interval) {
+            this.startContentInsightsInterval();
+        }
+        clearTimeout(this.contentInsightsProps.idleTimer);
+        this.setIdleTimer();
+    };
+
+    /**
+     * Call the resetIdleTimer if the user is active
+     *
+     * @private
+     * @return {void}
+     */
+    activeUserHandler = () => {
+        return throttle(() => {
+            this.resetIdleTimer();
+        }, CONTENT_INSIGHTS_ACTIVE_USER_THROTTLE);
+    };
+
+    /**
+     * Stops the content insights interval if the user goes inactive
+     *
+     * @private
+     * @return {void}
+     */
+    inactiveUserHandler = () => {
+        if (this.contentInsightsProps.interval) {
+            this.stopContentInsightsInterval();
+        }
+    };
+
+    /**
+     * Binds DOM listeners to manage if the user goes active or inactive.
+     *
+     * @private
+     * @return {void}
+     */
+    bindIdleUserEvents = container => {
+        if (container) {
+            container.addEventListener('mousemove', this.throttledActiveUserHandler);
+            container.addEventListener('mouseenter', this.throttledActiveUserHandler);
+            container.addEventListener('mouseleave', this.inactiveUserHandler);
+            container.addEventListener('focusin', this.throttledActiveUserHandler);
+            container.addEventListener('focusout', this.inactiveUserHandler);
+            container.addEventListener('click', this.throttledActiveUserHandler);
+            container.addEventListener('wheel', this.throttledActiveUserHandler);
+            container.addEventListener('keydown', this.throttledActiveUserHandler);
+            container.addEventListener('wheel', this.throttledActiveUserHandler);
+            container.addEventListener('touchstart', this.throttledActiveUserHandler);
+            container.addEventListener('touchmove', this.throttledActiveUserHandler);
+        }
+    };
+
+    /**
+     * Unbinds DOM listeners that manage if the user goes active or inactive.
+     *
+     * @private
+     * @return {void}
+     */
+    unbindIdleUserEvents = container => {
+        if (container) {
+            container.removeEventListener('mousemove', this.throttledActiveUserHandler);
+            container.removeEventListener('mouseenter', this.throttledActiveUserHandler);
+            container.removeEventListener('mouseleave', this.inactiveUserHandler);
+            container.removeEventListener('focusin', this.throttledActiveUserHandler);
+            container.removeEventListener('focusout', this.inactiveUserHandler);
+            container.removeEventListener('click', this.throttledActiveUserHandler);
+            container.removeEventListener('wheel', this.throttledActiveUserHandler);
+            container.removeEventListener('keydown', this.throttledActiveUserHandler);
+            container.removeEventListener('touchstart', this.throttledActiveUserHandler);
+            container.removeEventListener('touchmove', this.throttledActiveUserHandler);
+        }
+    };
+
+    /**
+     *  Construct and send the payload object to send to the BFF endpoint.
+     *
+     * @private
+     * @return {void}
+     */
+    reportContentInsight = () => {
+        const timeToBeReported = Date.now() - this.contentInsightsProps.startTime;
+
+        // Report only time with a minimum threshold for this moment. This is to avoid a situation that the
+        // user is just spamming the scroll event to change pages and not send a lot of requests.
+        // Ideally, we can just batch that data and send it later...
+
+        if (timeToBeReported > CONTENT_INSIGHTS_REPORT_TRESHOLD) {
+            // eslint-disable-next-line no-unused-vars
+            const { apiHost, token, sharedLink, sharedLinkPassword } = this.options;
+            const headers = getHeaders({}, token, sharedLink, sharedLinkPassword);
+
+            const events = [
+                {
+                    pageNumber: this.contentInsightsProps.currentPage,
+                    pageViewMs: Date.now() - this.contentInsightsProps.startTime,
+                    pageViewUTCTimestamp: Date.now(),
+                },
+            ];
+
+            const userEid = this.previewOptions.contentInsightsOptions
+                ? this.previewOptions.contentInsightsOptions.userEid
+                : '';
+
+            const fileOwnerEid = this.previewOptions.contentInsightsOptions
+                ? this.previewOptions.contentInsightsOptions.ownerEID
+                : '';
+
+            const userId = this.previewOptions.contentInsightsOptions
+                ? this.previewOptions.contentInsightsOptions.userID
+                : '';
+
+            const payload = {
+                events,
+                fileId: this.file.id,
+                fileLength: this.contentInsightsProps.fileLength,
+                fileOwnerEid,
+                fileType: this.contentInsightsProps.fileType,
+                fileVersionId: this.file.file_version ? this.file.file_version.id : '',
+                sessionId: this.contentInsightsProps.sessionId,
+                userEid,
+                userId,
+            };
+            //                type: this.contentInsightsProps.eventType,
+            console.log('SEND PAYLOAD', payload);
+            // http://localhost:4000/app-api/content-insights/activity
+            this.api
+                // .post(`${apiHost}/app-api/content-insights/activity`, payload, { headers })
+                .post(`http://localhost:4000/app-api/content-insights/activity`, { fileEvents: [payload] }, { headers })
+                .then(() => {
+                    console.log('data');
+                })
+                .catch(() => {
+                    // Don't retry more than the retry limit
+                    console.log('data');
+                });
+        }
+        this.contentInsightsProps.startTime = Date.now();
     };
 }
 

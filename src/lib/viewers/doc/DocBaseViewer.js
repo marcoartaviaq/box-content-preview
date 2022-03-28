@@ -1178,6 +1178,7 @@ class DocBaseViewer extends BaseViewer {
                 encoding: this.encoding,
                 numPages: pagesCount,
                 scale: currentScale,
+                currentPage: startPage,
             });
 
             // Add page IDs to each page after page structure is available
@@ -1283,6 +1284,10 @@ class DocBaseViewer extends BaseViewer {
         }
 
         this.emit('pagefocus', pageNumber);
+
+        this.emit(VIEWER_EVENT.pageChange, {
+            currentPage: pageNumber,
+        });
     }
 
     /**

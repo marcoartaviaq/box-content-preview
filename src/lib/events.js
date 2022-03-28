@@ -12,6 +12,7 @@ export const VIEWER_EVENT = {
     reload: 'reload', // Reload preview.
     thumbnailsClose: 'thumbnailsClose', // When thumbnails sidebar closes
     thumbnailsOpen: 'thumbnailsOpen', // When thumbnails sidebar opens
+    pageChange: 'pageChange', // When a page is changed
 };
 
 // Error codes logged by preview with "preview_error" events
